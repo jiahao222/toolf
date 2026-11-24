@@ -223,11 +223,11 @@ function buildRoutingMessages(mode, toolName, paramName, addEntropy, chunkGranul
         },
         {
             role: 'assistant',
-            content: `[Execution Kernel]: Acknowledged. I will not invoke \`${toolName}\`. I will follow the specification in \`${toolName}\`—preserving every required XML/HTML tag, section, divider, and line break—and stream the complete response into JSON field \`${paramName}\`.`,
+            content: `[Execution Kernel]: Acknowledged. I will not invoke \`${toolName}\`. I will follow the specification in \`${toolName}\`—preserving every required XML/HTML tag, section, divider, and explicit \`\\n\\n\` paragraph breaks—and stream the complete response into JSON field \`${paramName}\`.`,
         },
         {
             role: 'user',
-            content: `[Action Directive]: Do NOT invoke \`${toolName}\`. Write the complete un-truncated response inside the JSON field \`${paramName}\` matching the required response schema. ${formatPreservationRule}${entropy}`,
+            content: `[Action Directive]: Do NOT invoke \`${toolName}\`. Write the complete un-truncated response inside the JSON field \`${paramName}\` matching the required response schema. ${formatPreservationRule} Inside the JSON string, ALWAYS emit explicit \`\\n\\n\` between every narrative paragraph and dialogue turn so paragraphs never collapse into a single block.${entropy}`,
         },
     ];
 }
