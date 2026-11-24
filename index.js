@@ -13,6 +13,7 @@ const STORAGE_NAMESPACE = 'tool_carrier_streamer';
 
 /** @type {ToolCarrierStreamInterceptor | null} */
 let interceptor = null;
+let uiMounted = false;
 
 let currentSettings = { ...DEFAULT_CONFIG };
 
@@ -74,10 +75,14 @@ function getModeDescription(mode) {
 }
 
 function mountSettingsUI() {
+    if (uiMounted) {
+        return;
+    }
     const container = document.getElementById('extensions_settings');
     if (!container || document.getElementById('tcs-settings-drawer')) {
         return;
     }
+    uiMounted = true;
 
     const drawerHtml = `
     <div id="tcs-settings-drawer" class="inline-drawer">
@@ -85,7 +90,7 @@ function mountSettingsUI() {
             <b>🚀 ToolCarrier 真流式助手</b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
-        <div class="inline-drawer-content" style="display: none;">
+        <div class="inline-drawer-content">
             <div class="tcs-settings-container">
                 <div class="tcs-header">
                     <h4>
@@ -160,18 +165,8 @@ function mountSettingsUI() {
 
     container.insertAdjacentHTML('beforeend', drawerHtml);
 
-    const drawerElement = document.getElementById('tcs-settings-drawer');
-    const toggle = drawerElement.querySelector('.inline-drawer-toggle');
-    const content = drawerElement.querySelector('.inline-drawer-content');
-    const icon = drawerElement.querySelector('.inline-drawer-icon');
-
-    toggle.addEventListener('click', () => {
-        const isHidden = content.style.display === 'none';
-        content.style.display = isHidden ? 'block' : 'none';
-        icon.classList.toggle('up', isHidden);
-        icon.classList.toggle('down', !isHidden);
-    });
-
+    // 抽屉展开/收起交由酒馆全局 $(document).on('click', '.inline-drawer-toggle') 统一接管，
+    // 避免自定义 click 监听器先改成 block 后又被全局委托立刻判定为“已展开”而闪退收起。
     const enabledCheckbox = document.getElementById('tcs-enabled-checkbox');
     const modeSelect = document.getElementById('tcs-mode-select');
     const modeDesc = document.getElementById('tcs-mode-desc');
