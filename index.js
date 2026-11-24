@@ -6,6 +6,7 @@
 import {
     ToolCarrierStreamInterceptor,
     CARRIER_MODES,
+    CHUNK_GRANULARITIES,
     DEFAULT_CONFIG,
 } from './fetch-interceptor.js';
 
@@ -65,13 +66,16 @@ async function saveSettings() {
 }
 
 function getModeDescription(mode) {
+    if (mode === CARRIER_MODES.CHUNKED_TOOL_CALL) {
+        return '推荐（真工具 + 真流式）：tools(required) 强制走真正 tool_calls，并在同 1 次请求内让模型连续发起多次短段 tool_calls 实时下发，前端逐段无缝拼接并转为 stop，严格仅 1 次 API 调用。';
+    }
     if (mode === CARRIER_MODES.PYTHON_SCRIPT) {
         return 'tools(AUTO) 承载全部提示词，让模型在正文流输出 Python 脚本三引号字符串，前端实时剥离 def / 变量 / return 外壳。';
     }
     if (mode === CARRIER_MODES.TOOL_CALL) {
-        return '传统 tool_choice=required 模式，适合 Vertex AI 等原生支持 partialArgs / 流式 tool_calls 的渠道。';
+        return '传统单次 tool_choice=required 模式，适合 Vertex AI / Claude / OpenAI 等原生支持 partialArgs / 流式 tool_calls 的渠道。';
     }
-    return '推荐：tools(AUTO) 承载全部提示词 + Structured Output JSON Schema 约束解码，在 AIStudio2API 上实现 1 次请求真流式输出，并自动兜底偶发 tool_call。';
+    return 'tools(AUTO) 承载全部提示词 + Structured Output JSON Schema 约束解码，走正文流实时剥壳并自动兜底偶发 tool_call。';
 }
 
 function mountSettingsUI() {
@@ -114,11 +118,22 @@ function mountSettingsUI() {
                 <div class="tcs-form-group">
                     <label for="tcs-mode-select">输出承载模式</label>
                     <select id="tcs-mode-select" class="tcs-select">
-                        <option value="${CARRIER_MODES.JSON_SCHEMA}" ${currentSettings.mode === CARRIER_MODES.JSON_SCHEMA ? 'selected' : ''}>方案 B：JSON Schema 真流式（推荐）</option>
+                        <option value="${CARRIER_MODES.CHUNKED_TOOL_CALL}" ${currentSettings.mode === CARRIER_MODES.CHUNKED_TOOL_CALL ? 'selected' : ''}>方案 C：单轮微 Tool Call 分段真流式（推荐）</option>
+                        <option value="${CARRIER_MODES.JSON_SCHEMA}" ${currentSettings.mode === CARRIER_MODES.JSON_SCHEMA ? 'selected' : ''}>方案 B：JSON Schema 真流式</option>
                         <option value="${CARRIER_MODES.PYTHON_SCRIPT}" ${currentSettings.mode === CARRIER_MODES.PYTHON_SCRIPT ? 'selected' : ''}>方案 A：Python 脚本真流式去壳</option>
-                        <option value="${CARRIER_MODES.TOOL_CALL}" ${currentSettings.mode === CARRIER_MODES.TOOL_CALL ? 'selected' : ''}>兼容模式：强制 Tool Call</option>
+                        <option value="${CARRIER_MODES.TOOL_CALL}" ${currentSettings.mode === CARRIER_MODES.TOOL_CALL ? 'selected' : ''}>兼容模式：单次强制 Tool Call</option>
                     </select>
                     <div id="tcs-mode-desc" class="description" style="margin-top: 6px;">${getModeDescription(currentSettings.mode)}</div>
+                </div>
+
+                <div class="tcs-form-group" id="tcs-granularity-group" style="display: ${currentSettings.mode === CARRIER_MODES.CHUNKED_TOOL_CALL ? 'block' : 'none'};">
+                    <label for="tcs-granularity-select">微 Tool Call 分段粒度</label>
+                    <select id="tcs-granularity-select" class="tcs-select">
+                        <option value="${CHUNK_GRANULARITIES.FAST}" ${currentSettings.chunkGranularity === CHUNK_GRANULARITIES.FAST ? 'selected' : ''}>快响应（40~80 字/段，首段最快）</option>
+                        <option value="${CHUNK_GRANULARITIES.BALANCED}" ${currentSettings.chunkGranularity === CHUNK_GRANULARITIES.BALANCED ? 'selected' : ''}>均衡（80~150 字/段，推荐）</option>
+                        <option value="${CHUNK_GRANULARITIES.LONG}" ${currentSettings.chunkGranularity === CHUNK_GRANULARITIES.LONG ? 'selected' : ''}>长文稳态（150~250 字/段，适合 3000+ 字）</option>
+                    </select>
+                    <div class="description" style="margin-top: 6px;">长文建议选「均衡」或「长文稳态」，避免单轮调用次数过多导致后半段被模型合并</div>
                 </div>
 
                 <div class="tcs-form-group">
@@ -170,6 +185,8 @@ function mountSettingsUI() {
     const enabledCheckbox = document.getElementById('tcs-enabled-checkbox');
     const modeSelect = document.getElementById('tcs-mode-select');
     const modeDesc = document.getElementById('tcs-mode-desc');
+    const granularityGroup = document.getElementById('tcs-granularity-group');
+    const granularitySelect = document.getElementById('tcs-granularity-select');
     const toolNameInput = document.getElementById('tcs-tool-name');
     const paramNameInput = document.getElementById('tcs-param-name');
     const consumeCheckbox = document.getElementById('tcs-consume-checkbox');
@@ -182,6 +199,7 @@ function mountSettingsUI() {
         currentSettings = {
             enabled: enabledCheckbox.checked,
             mode: modeSelect.value,
+            chunkGranularity: granularitySelect.value || DEFAULT_CONFIG.chunkGranularity,
             toolName: toolNameInput.value.trim() || DEFAULT_CONFIG.toolName,
             paramName: paramNameInput.value.trim() || DEFAULT_CONFIG.paramName,
             consumeToolCalls: consumeCheckbox.checked,
@@ -190,6 +208,7 @@ function mountSettingsUI() {
         };
 
         modeDesc.textContent = getModeDescription(currentSettings.mode);
+        granularityGroup.style.display = currentSettings.mode === CARRIER_MODES.CHUNKED_TOOL_CALL ? 'block' : 'none';
         statusIndicator.classList.toggle('disabled', !currentSettings.enabled);
         statusText.textContent = currentSettings.enabled ? '已激活' : '未启用';
 
@@ -199,6 +218,7 @@ function mountSettingsUI() {
 
     enabledCheckbox.addEventListener('change', updateState);
     modeSelect.addEventListener('change', updateState);
+    granularitySelect.addEventListener('change', updateState);
     toolNameInput.addEventListener('change', updateState);
     paramNameInput.addEventListener('change', updateState);
     consumeCheckbox.addEventListener('change', updateState);

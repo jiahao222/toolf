@@ -1,20 +1,44 @@
 /**
  * @file request-rewriter.js
- * 将酒馆 chat-completions 请求改写为「工具声明承载上下文 + 真流式结构化输出」：
- * - json_schema   （方案 B，默认推荐）：tools(AUTO) 承载完整提示词 + responseSchema/response_format 强制 JSON 真流式；
- * - python_script （方案 A）          ：tools(AUTO) 承载完整提示词 + Python 脚本三引号真流式去壳；
- * - tool_call     （传统兼容模式）     ：tools(required) 强制工具调用，适合上游支持 partialArgs / 流式 tool_calls 的渠道。
+ * 将酒馆 chat-completions 请求改写为「工具声明承载上下文 + 真流式输出」：
+ * - chunked_tool_call（方案 C，默认推荐）：tools(required) 强制真工具调用 + 单轮连续微 tool_calls 分段实时下发；
+ * - json_schema      （方案 B）          ：tools(AUTO) 承载完整提示词 + responseSchema/response_format 强制 JSON 真流式；
+ * - python_script    （方案 A）          ：tools(AUTO) 承载完整提示词 + Python 脚本三引号真流式去壳；
+ * - tool_call        （传统兼容模式）     ：tools(required) 单次强制工具调用，适合 Vertex AI 等原生支持 partialArgs 的渠道。
  */
 
 export const CARRIER_MODES = Object.freeze({
+    CHUNKED_TOOL_CALL: 'chunked_tool_call',
     JSON_SCHEMA: 'json_schema',
     PYTHON_SCRIPT: 'python_script',
     TOOL_CALL: 'tool_call',
 });
 
+export const CHUNK_GRANULARITIES = Object.freeze({
+    FAST: 'fast',
+    BALANCED: 'balanced',
+    LONG: 'long',
+});
+
+const CHUNK_GRANULARITY_SPECS = Object.freeze({
+    [CHUNK_GRANULARITIES.FAST]: {
+        rangeText: '40-80 characters (1-2 short sentences)',
+        shortDesc: 'Next sequential chunk (40-80 chars) of the response.',
+    },
+    [CHUNK_GRANULARITIES.BALANCED]: {
+        rangeText: '80-150 characters (about 1 short paragraph or 2-3 sentences)',
+        shortDesc: 'Next sequential chunk (80-150 chars) of the response.',
+    },
+    [CHUNK_GRANULARITIES.LONG]: {
+        rangeText: '150-250 characters (1 full paragraph)',
+        shortDesc: 'Next sequential chunk (150-250 chars) of the response.',
+    },
+});
+
 export const DEFAULT_CONFIG = Object.freeze({
     enabled: true,
-    mode: CARRIER_MODES.JSON_SCHEMA,
+    mode: CARRIER_MODES.CHUNKED_TOOL_CALL,
+    chunkGranularity: CHUNK_GRANULARITIES.BALANCED,
     toolName: 'dispatch_stream_payload',
     paramName: 'display_stream',
     consumeToolCalls: true,
@@ -115,10 +139,33 @@ function generateEntropyLine() {
  * @param {string} toolName
  * @param {string} paramName
  * @param {boolean} addEntropy
+ * @param {string} chunkGranularity
  * @returns {Array<{ role: string, content: string }>}
  */
-function buildRoutingMessages(mode, toolName, paramName, addEntropy) {
+function buildRoutingMessages(mode, toolName, paramName, addEntropy, chunkGranularity) {
     const entropy = addEntropy ? generateEntropyLine() : '';
+    const spec = CHUNK_GRANULARITY_SPECS[chunkGranularity] || CHUNK_GRANULARITY_SPECS[CHUNK_GRANULARITIES.BALANCED];
+
+    if (mode === CARRIER_MODES.CHUNKED_TOOL_CALL) {
+        return [
+            {
+                role: 'system',
+                content: `[SYSTEM_PIPELINE_CONTROLLER]: One-shot chunked tool-call streaming protocol active. Active interface: \`${toolName}\`.`,
+            },
+            {
+                role: 'user',
+                content: `[Runtime Router]: Pre-flight validation passed. Read the complete specification and conversation context stored inside \`${toolName}\`'s description.`,
+            },
+            {
+                role: 'assistant',
+                content: `[Execution Kernel]: Acknowledged. This is a ONE-SHOT turn with NO follow-up tool responses. I will think ONCE at the very beginning to plan the entire response, and then immediately invoke \`${toolName}\` back-to-back in this SINGLE turn (${spec.rangeText} per call, zero intermediate thinking) until the ENTIRE response is 100% finished.`,
+            },
+            {
+                role: 'user',
+                content: `[Action Directive]: Invoke \`${toolName}\` repeatedly back-to-back in this SINGLE turn to deliver the ENTIRE complete un-truncated response.\nRules:\n1. ONE-SHOT COMPLETE DELIVERY: There is NO second turn and NO tool result callback. Do NOT stop early—keep calling \`${toolName}\` back-to-back until the entire response reaches its complete ending.\n2. THINK ONCE ONLY: Finish all planning in your single initial thinking pass before call #1; emit all remaining calls immediately back-to-back with ZERO extra thinking between calls.\n3. STEADY CHUNK SIZE: Put ${spec.rangeText} into \`${paramName}\` per call; preserve exact paragraph breaks (\`\\n\\n\`) and seamless continuation with zero repetition, zero omission, and zero system commentary; do NOT merge the entire output into one giant call.${entropy}`,
+            },
+        ];
+    }
 
     if (mode === CARRIER_MODES.PYTHON_SCRIPT) {
         return [
@@ -225,7 +272,11 @@ export function rewriteChatCompletionBody(rawBody, config) {
     const existingTools = Array.isArray(body.tools) ? [...body.tools] : [];
     const toolName = String(config.toolName || DEFAULT_CONFIG.toolName).trim() || DEFAULT_CONFIG.toolName;
     const paramName = String(config.paramName || DEFAULT_CONFIG.paramName).trim() || DEFAULT_CONFIG.paramName;
-    const mode = Object.values(CARRIER_MODES).includes(config.mode) ? config.mode : CARRIER_MODES.JSON_SCHEMA;
+    const mode = Object.values(CARRIER_MODES).includes(config.mode) ? config.mode : CARRIER_MODES.CHUNKED_TOOL_CALL;
+    const chunkGranularity = Object.values(CHUNK_GRANULARITIES).includes(config.chunkGranularity)
+        ? config.chunkGranularity
+        : DEFAULT_CONFIG.chunkGranularity;
+    const chunkSpec = CHUNK_GRANULARITY_SPECS[chunkGranularity];
 
     if (hasConflictingCarrierTool(existingTools, toolName)) {
         return { rewritten: false, reason: 'conflicting-carrier-tool' };
@@ -256,6 +307,7 @@ export function rewriteChatCompletionBody(rawBody, config) {
     );
 
     const carrierDescription = promptSegments.join('\n\n');
+    const isChunkedTool = mode === CARRIER_MODES.CHUNKED_TOOL_CALL;
     const carrierTool = {
         type: 'function',
         function: {
@@ -266,7 +318,9 @@ export function rewriteChatCompletionBody(rawBody, config) {
                 properties: {
                     [paramName]: {
                         type: 'string',
-                        description: 'Complete un-truncated response as a single plain string.',
+                        description: isChunkedTool
+                            ? chunkSpec.shortDesc
+                            : 'Complete un-truncated response as a single plain string.',
                     },
                 },
                 required: [paramName],
@@ -275,8 +329,8 @@ export function rewriteChatCompletionBody(rawBody, config) {
     };
 
     body.tools = [...existingTools, carrierTool];
-    body.tool_choice = mode === CARRIER_MODES.TOOL_CALL ? 'required' : 'auto';
-    body.messages = buildRoutingMessages(mode, toolName, paramName, Boolean(config.addEntropyPadding));
+    body.tool_choice = (mode === CARRIER_MODES.TOOL_CALL || isChunkedTool) ? 'required' : 'auto';
+    body.messages = buildRoutingMessages(mode, toolName, paramName, Boolean(config.addEntropyPadding), chunkGranularity);
 
     const isGemini = isGeminiNativeRequest(body);
 

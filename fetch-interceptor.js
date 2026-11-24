@@ -15,11 +15,12 @@ import {
 } from './extractors.js';
 import {
     CARRIER_MODES,
+    CHUNK_GRANULARITIES,
     DEFAULT_CONFIG,
     rewriteChatCompletionBody,
 } from './request-rewriter.js';
 
-export { CARRIER_MODES, DEFAULT_CONFIG };
+export { CARRIER_MODES, CHUNK_GRANULARITIES, DEFAULT_CONFIG };
 
 const CHAT_GENERATE_URL_RE = /\/api\/backends\/chat-completions\/generate\b/;
 
@@ -244,7 +245,9 @@ export class ToolCarrierStreamInterceptor {
         const self = this;
         const textExtractor = this.#createTextExtractor(meta.mode, meta.paramName);
         const openaiToolExtractors = new Map();
+        const openaiToolCallIds = new Map();
         const carrierToolIndices = new Set();
+        const isChunkedToolMode = meta.mode === CARRIER_MODES.CHUNKED_TOOL_CALL;
         let sawCarrierToolCall = false;
         let googleToolEmitted = '';
         let utf8Remainder = '';
@@ -309,6 +312,22 @@ export class ToolCarrierStreamInterceptor {
                     if (carrierToolIndices.has(idx)) {
                         sawCarrierToolCall = true;
                         mutated = true;
+                        // 兼容部分反代复用相同 index 但换新 id（或重复传 function.name）开启下一段微 tool_call
+                        const prevId = openaiToolCallIds.get(idx);
+                        const isNewCallOnSameIndex = Boolean(
+                            (tc.id && prevId && tc.id !== prevId)
+                            || (!tc.id && fnName && openaiToolExtractors.get(idx)?.isDone),
+                        );
+                        if (isNewCallOnSameIndex) {
+                            const flushed = openaiToolExtractors.get(idx)?.flush() || '';
+                            if (flushed) {
+                                delta.content = (delta.content || '') + flushed;
+                            }
+                            openaiToolExtractors.delete(idx);
+                        }
+                        if (tc.id) {
+                            openaiToolCallIds.set(idx, tc.id);
+                        }
                         if (!openaiToolExtractors.has(idx)) {
                             openaiToolExtractors.set(idx, new JsonFieldStreamExtractor({
                                 targetField: meta.paramName,
@@ -401,14 +420,18 @@ export class ToolCarrierStreamInterceptor {
                         continue;
                     }
 
-                    // 兜底处理 Gemini functionCall
+                    // 处理 Gemini functionCall（chunked_tool_call 主路径 + AUTO 模式兜底）
                     if (part.functionCall && self.#isCarrierTool(part.functionCall.name, meta)) {
                         sawCarrierToolCall = true;
                         mutated = true;
                         const fullOrDelta = extractFromToolArgs(part.functionCall.args, meta.paramName);
                         let deltaText = '';
                         if (fullOrDelta) {
-                            if (fullOrDelta.startsWith(googleToolEmitted)) {
+                            if (isChunkedToolMode) {
+                                // 单轮微 tool_calls 模式下，每个 functionCall 都是独立顺序分片，直接原样拼接
+                                deltaText = fullOrDelta;
+                                googleToolEmitted += fullOrDelta;
+                            } else if (fullOrDelta.startsWith(googleToolEmitted)) {
                                 deltaText = fullOrDelta.slice(googleToolEmitted.length);
                                 googleToolEmitted = fullOrDelta;
                             } else {
@@ -582,7 +605,8 @@ export class ToolCarrierStreamInterceptor {
             }
             if (handledByTool) {
                 if (extractedParts.length > 0) {
-                    message.content = extractedParts.join('\n');
+                    const joiner = meta.mode === CARRIER_MODES.CHUNKED_TOOL_CALL ? '' : '\n';
+                    message.content = extractedParts.join(joiner);
                 }
                 if (this.config.consumeToolCalls) {
                     if (remaining.length > 0) {

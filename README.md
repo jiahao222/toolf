@@ -10,12 +10,13 @@ Google AI Studio 底层协议对 `functionCall` / `executableCode` 均为整包�
 
 本扩展在不修改任何预设文件、不修改 `AIStudio2API` 服务端的前提下，单轮对话严格仅调用 **1 次 API**：
 
-1. **请求阶段**：把预设与对话历史打包进 `tools[...].function.description`，将 `tool_choice` 设为 `auto`（Gemini 原生自动映射为 `mode: AUTO`），并用干净路由壳替代 `messages`。
+1. **请求阶段**：把预设与对话历史打包进 `tools[...].function.description`，并用干净路由壳替代 `messages`。
 2. **输出承载（支持在扩展面板随时切换）**：
-   - **方案 B：`JSON Schema 真流式`（默认推荐）**——自动注入 `responseSchema`（Gemini 原生）或 `response_format: json_schema`（OpenAI 兼容），服务端约束解码保证 100% 合法 JSON 流，前端状态机实时剥离 `{"display_stream":"..."}` 外壳并逐字输出。
+   - **方案 C：`单轮微 Tool Call 分段真流式`（默认推荐）**——保持 `tool_choice: required`（Gemini 原生为 `ANY`），指令模型在**同 1 次请求内连续发起多次短段 `tool_calls`**（支持在面板选择 `40~80` / `80~150` / `150~250` 字粒度）。由于 Google AI Studio 服务端每生成完 1 个 `functionCall` 就会立刻 flush，扩展在前端逐段实时解包拼接成正文并将 `finish_reason` 转为 `stop`，**100% 走真工具通道 + 实时分段流式 + 严格仅 1 次 API 调用**。
+   - **方案 B：`JSON Schema 真流式`**——自动注入 `responseSchema`（Gemini 原生）或 `response_format: json_schema`（OpenAI 兼容），服务端约束解码保证 100% 合法 JSON 流，前端状态机实时剥离 `{"display_stream":"..."}` 外壳并逐字输出。
    - **方案 A：`Python 脚本真流式去壳`**——指令模型输出 `def render_output(): payload = """..."""` 代码块，前端状态机实时剥离函数头、三引号与 `return` 尾部，只向酒馆流式吐正文。
-   - **兼容模式：`强制 Tool Call`**——保持 `tool_choice: required`，用于原生支持 `partialArgs` / 流式 `tool_calls` 的 Vertex AI 等渠道。
-3. **自动兜底**：若 `AUTO` 模式下模型偶发真的触发了 `functionCall` / `tool_calls`，扩展会自动解包还原成正文、将 `finish_reason` 置为 `stop`，并清理 TauriTavern 末尾补发的 `delta.native`，不触发多余第二轮请求。
+   - **兼容模式：`单次强制 Tool Call`**——保持单次 `tool_choice: required`，用于原生支持 `partialArgs` / 流式 `tool_calls` 的 Vertex AI / Claude / OpenAI 等渠道。
+3. **自动兜底与历史防污染**：自动把承载工具的 `tool_calls` / `functionCall` 消费并还原为正文、`finish_reason` 置为 `stop`，并清理 TauriTavern 末尾补发的 `delta.native`，不触发多余第二轮请求。
 
 ---
 

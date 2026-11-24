@@ -6,7 +6,7 @@
     "js": "index.js",
     "css": "style.css",
     "author": "TauriTavern",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "home_page": "https://github.com/jiahao222/toolf",
-    "description": "保留工具声明承载上下文，同时通过 Structured Output JSON / Python 脚本外壳实现 AIStudio2API 等渠道的真正实时流式输出，并自动兜底原生 Tool Call。"
+    "description": "保留工具声明承载上下文，支持「单轮微 Tool Call 分段真流式」（真工具调用 + 实时流式）以及 Structured Output JSON / Python 脚本真流式去壳，适配 AIStudio2API 等渠道。"
 }

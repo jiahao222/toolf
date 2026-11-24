@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
     ToolCarrierStreamInterceptor,
     CARRIER_MODES,
+    CHUNK_GRANULARITIES,
     DEFAULT_CONFIG,
 } from '../fetch-interceptor.js';
 import { rewriteChatCompletionBody } from '../request-rewriter.js';
@@ -59,7 +60,10 @@ test('rewriteChatCompletionBody - OpenAI 兼容源方案 B 注入 tools(auto) + 
         ],
     });
 
-    const res = rewriteChatCompletionBody(raw, DEFAULT_CONFIG);
+    const res = rewriteChatCompletionBody(raw, {
+        ...DEFAULT_CONFIG,
+        mode: CARRIER_MODES.JSON_SCHEMA,
+    });
     assert.equal(res.rewritten, true);
     assert.equal(res.meta.isGemini, false);
 
@@ -83,7 +87,10 @@ test('rewriteChatCompletionBody - Gemini 原生源方案 B 注入 tools(auto) + 
         messages: [{ role: 'user', content: '写一段开篇' }],
     });
 
-    const res = rewriteChatCompletionBody(raw, DEFAULT_CONFIG);
+    const res = rewriteChatCompletionBody(raw, {
+        ...DEFAULT_CONFIG,
+        mode: CARRIER_MODES.JSON_SCHEMA,
+    });
     assert.equal(res.rewritten, true);
     assert.equal(res.meta.isGemini, true);
 
@@ -277,4 +284,126 @@ test('ToolCarrierStreamInterceptor - OpenAI 非流式 JSON 响应去壳', async 
     });
     const json = await wrapped.json();
     assert.equal(json.choices[0].message.content, '非流式正文');
+});
+
+test('rewriteChatCompletionBody - 默认方案 C（单轮微 Tool Call）注入 tools(required) 与分段粒度指令', () => {
+    const raw = JSON.stringify({
+        chat_completion_source: 'custom',
+        custom_api_format: 'openai_compat',
+        model: 'gemini-4-argon',
+        stream: true,
+        messages: [
+            { role: 'system', content: '世界观设定：霜星七号' },
+            { role: 'user', content: '开始打捞任务' },
+        ],
+    });
+
+    const res = rewriteChatCompletionBody(raw, {
+        ...DEFAULT_CONFIG,
+        chunkGranularity: CHUNK_GRANULARITIES.FAST,
+    });
+    assert.equal(res.rewritten, true);
+    assert.equal(res.meta.mode, CARRIER_MODES.CHUNKED_TOOL_CALL);
+
+    const parsed = JSON.parse(res.body);
+    assert.equal(parsed.tool_choice, 'required');
+    assert.equal(parsed.response_format, undefined);
+    assert.equal(parsed.responseSchema, undefined);
+    assert.equal(parsed.tools.length, 1);
+    assert.ok(parsed.tools[0].function.description.includes('世界观设定：霜星七号'));
+    assert.ok(parsed.messages[3].content.includes('40-80 characters'));
+});
+
+test('ToolCarrierStreamInterceptor - OpenAI SSE 方案 C 单轮多次微 tool_calls 实时逐段解包并转为 stop', async () => {
+    const interceptor = new ToolCarrierStreamInterceptor(DEFAULT_CONFIG);
+    const resp = makeSseResponse([
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'dispatch_stream_payload', arguments: JSON.stringify({ display_stream: '第一段正文，' }) } }] }, finish_reason: null }] })}\n\n`,
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 1, id: 'call_2', type: 'function', function: { name: 'dispatch_stream_payload', arguments: JSON.stringify({ display_stream: '第二段无缝衔接。\\n\\n' }) } }] }, finish_reason: null }] })}\n\n`,
+        // 模拟部分反代复用 index=1 但切换新 call_id
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 1, id: 'call_3', type: 'function', function: { name: 'dispatch_stream_payload', arguments: JSON.stringify({ display_stream: '第三段收尾。' }) } }] }, finish_reason: null }] })}\n\n`,
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n`,
+        'data: [DONE]\n\n',
+    ]);
+
+    const wrapped = interceptor.wrapEventStreamResponse(resp, {
+        mode: CARRIER_MODES.CHUNKED_TOOL_CALL,
+        toolName: 'dispatch_stream_payload',
+        paramName: 'display_stream',
+        clientToolNames: new Set(),
+        isGemini: false,
+    });
+
+    const events = await readSseEvents(wrapped);
+    const chunks = [];
+    let finishReason = null;
+    for (const ev of events) {
+        if (ev === '[DONE]') continue;
+        const ch = ev.choices?.[0];
+        assert.equal(ch?.delta?.tool_calls, undefined);
+        if (ch?.delta?.content) chunks.push(ch.delta.content);
+        if (ch?.finish_reason) finishReason = ch.finish_reason;
+    }
+
+    assert.equal(chunks.length, 3);
+    assert.equal(chunks.join(''), '第一段正文，第二段无缝衔接。\\n\\n第三段收尾。');
+    assert.equal(finishReason, 'stop');
+});
+
+test('ToolCarrierStreamInterceptor - Gemini SSE 方案 C 多段 functionCall 顺序无缝输出', async () => {
+    const interceptor = new ToolCarrierStreamInterceptor(DEFAULT_CONFIG);
+    const resp = makeSseResponse([
+        `data: ${JSON.stringify({ candidates: [{ index: 0, content: { role: 'model', parts: [{ functionCall: { name: 'dispatch_stream_payload', args: { display_stream: '秋雨如瓢泼，' } } }] } }] })}\n\n`,
+        `data: ${JSON.stringify({ candidates: [{ index: 0, content: { role: 'model', parts: [{ functionCall: { name: 'dispatch_stream_payload', args: { display_stream: '秋雨如瓢泼，' } } }] } }] })}\n\n`,
+        `data: ${JSON.stringify({ candidates: [{ index: 0, content: { role: 'model', parts: [{ functionCall: { name: 'dispatch_stream_payload', args: { display_stream: '客栈孤灯明灭。' } } }] }, finishReason: 'STOP' }] })}\n\n`,
+    ]);
+
+    const wrapped = interceptor.wrapEventStreamResponse(resp, {
+        mode: CARRIER_MODES.CHUNKED_TOOL_CALL,
+        toolName: 'dispatch_stream_payload',
+        paramName: 'display_stream',
+        clientToolNames: new Set(),
+        isGemini: true,
+    });
+
+    const events = await readSseEvents(wrapped);
+    const chunks = [];
+    for (const ev of events) {
+        for (const p of ev.candidates?.[0]?.content?.parts || []) {
+            assert.equal(p.functionCall, undefined);
+            if (p.text) chunks.push(p.text);
+        }
+    }
+
+    assert.equal(chunks.length, 3);
+    assert.equal(chunks.join(''), '秋雨如瓢泼，秋雨如瓢泼，客栈孤灯明灭。');
+});
+
+test('ToolCarrierStreamInterceptor - OpenAI 非流式 JSON 方案 C 多段 tool_calls 无缝拼接', async () => {
+    const interceptor = new ToolCarrierStreamInterceptor(DEFAULT_CONFIG);
+    const mock = new Response(JSON.stringify({
+        choices: [{
+            index: 0,
+            message: {
+                role: 'assistant',
+                content: null,
+                tool_calls: [
+                    { id: 'c1', type: 'function', function: { name: 'dispatch_stream_payload', arguments: JSON.stringify({ display_stream: '前半句，' }) } },
+                    { id: 'c2', type: 'function', function: { name: 'dispatch_stream_payload', arguments: JSON.stringify({ display_stream: '后半句。' }) } },
+                ],
+            },
+            finish_reason: 'tool_calls',
+        }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+
+    const wrapped = await interceptor.wrapJsonResponse(mock, {
+        mode: CARRIER_MODES.CHUNKED_TOOL_CALL,
+        toolName: 'dispatch_stream_payload',
+        paramName: 'display_stream',
+        clientToolNames: new Set(),
+        isGemini: false,
+    });
+    const json = await wrapped.json();
+    assert.equal(json.choices[0].message.content, '前半句，后半句。');
+    assert.equal(json.choices[0].message.tool_calls, undefined);
+    assert.equal(json.choices[0].finish_reason, 'stop');
 });
